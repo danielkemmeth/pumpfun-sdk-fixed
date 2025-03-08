@@ -1,513 +1,978 @@
-import {
-  Commitment,
-  Connection,
-  Finality,
-  Keypair,
-  PublicKey,
-  Transaction,
-} from "@solana/web3.js";
-import { Program, Provider } from "@coral-xyz/anchor";
-import { GlobalAccount } from "./globalAccount";
-import {
-  CompleteEvent,
-  CreateEvent,
-  CreateTokenMetadata,
-  PriorityFee,
-  PumpFunEventHandlers,
-  PumpFunEventType,
-  SetParamsEvent,
-  TradeEvent,
-  TransactionResult,
-} from "./types";
-import {
-  toCompleteEvent,
-  toCreateEvent,
-  toSetParamsEvent,
-  toTradeEvent,
-} from "./";
-import {
-  createAssociatedTokenAccountInstruction,
-  getAccount,
-  getAssociatedTokenAddress,
-} from "@solana/spl-token";
-import { BondingCurveAccount } from "./bondingCurveAccount";
-import { BN } from "bn.js";
-import {
-  DEFAULT_COMMITMENT,
-  DEFAULT_FINALITY,
-  calculateWithSlippageBuy,
-  calculateWithSlippageSell,
-  sendTx,
-} from "./util";
-import { PumpFun, IDL } from "./IDL";
-const PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
-const MPL_TOKEN_METADATA_PROGRAM_ID =
-  "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s";
-
-export const GLOBAL_ACCOUNT_SEED = "global";
-export const MINT_AUTHORITY_SEED = "mint-authority";
-export const BONDING_CURVE_SEED = "bonding-curve";
-export const METADATA_SEED = "metadata";
-
-export const DEFAULT_DECIMALS = 6;
-
-export class PumpFunSDK {
-  public program: Program<PumpFun>;
-  public connection: Connection;
-  constructor(provider?: Provider) {
-    this.program = new Program<PumpFun>(IDL as PumpFun, provider);
-    this.connection = this.program.provider.connection;
-  }
-
-  async createAndBuy (
-    creator: Keypair,
-    mint: Keypair,
-    createTokenMetadata: CreateTokenMetadata,
-    buyAmountSol: bigint,
-    slippageBasisPoints: bigint = 500n,
-    priorityFees?: PriorityFee,
-    commitment: Commitment = DEFAULT_COMMITMENT,
-    finality: Finality = DEFAULT_FINALITY
-  ): Promise<TransactionResult> {
-    // let tokenMetadata = await this.createTokenMetadata(createTokenMetadata);
-
-
-  // console.log("createTokenMetadata", createTokenMetadata);
-
-    let createTx = await this.getCreateInstructions(
-      creator.publicKey,
-      createTokenMetadata.name,
-      createTokenMetadata.symbol,
-      createTokenMetadata.metadataUri,
-      mint
-    );
-
-
-
-    //console.log("createTx", createTx.serialize().toString("base64"));
-     
-    let newTx = new Transaction().add(createTx);
-
-    //  console.log(newTx.serialize().toString("base64")); 
-    console.log("buyAmountSol", buyAmountSol);
-
-    if (buyAmountSol > 0) {
-      const globalAccount = await this.getGlobalAccount(commitment);
-      const buyAmount = globalAccount.getInitialBuyPrice(buyAmountSol);
-      const buyAmountWithSlippage = calculateWithSlippageBuy(
-        buyAmountSol,
-        slippageBasisPoints
-      );
-
-      const buyTx = await this.getBuyInstructions(
-        creator.publicKey,
-        mint.publicKey,
-        globalAccount.feeRecipient,
-        buyAmount,
-        buyAmountWithSlippage
-      );
-
-      newTx.add(buyTx);
-    }
-
-    let createResults = await sendTx(
-      this.connection,
-      newTx,
-      creator.publicKey,
-      [creator, mint],
-      priorityFees,
-      commitment,
-      finality
-    );
-    return createResults;
-  }
-
-  async buy(
-    buyer: Keypair,
-    mint: PublicKey,
-    buyAmountSol: bigint,
-    slippageBasisPoints: bigint = 500n,
-    priorityFees?: PriorityFee,
-    commitment: Commitment = DEFAULT_COMMITMENT,
-    finality: Finality = DEFAULT_FINALITY
-  ): Promise<TransactionResult> {
-    let buyTx = await this.getBuyInstructionsBySolAmount(
-      buyer.publicKey,
-      mint,
-      buyAmountSol,
-      slippageBasisPoints,
-      commitment
-    );
-
-    let buyResults = await sendTx(
-      this.connection,
-      buyTx,
-      buyer.publicKey,
-      [buyer],
-      priorityFees,
-      commitment,
-      finality
-    );
-    return buyResults;
-  }
-
-  async sell(
-    seller: Keypair,
-    mint: PublicKey,
-    sellTokenAmount: bigint,
-    slippageBasisPoints: bigint = 500n,
-    priorityFees?: PriorityFee,
-    commitment: Commitment = DEFAULT_COMMITMENT,
-    finality: Finality = DEFAULT_FINALITY
-  ): Promise<TransactionResult> {
-    let sellTx = await this.getSellInstructionsByTokenAmount(
-      seller.publicKey,
-      mint,
-      sellTokenAmount,
-      slippageBasisPoints,
-      commitment
-    );
-
-    let sellResults = await sendTx(
-      this.connection,
-      sellTx,
-      seller.publicKey,
-      [seller],
-      priorityFees,
-      commitment,
-      finality
-    );
-    return sellResults;
-  }
-
-  //create token instructions
-  async getCreateInstructions(
-    creator: PublicKey,
-    name: string,
-    symbol: string,
-    uri: string,
-    mint: Keypair
-  ) {
-    const mplTokenMetadata = new PublicKey(MPL_TOKEN_METADATA_PROGRAM_ID);
-
-    const [metadataPDA] = PublicKey.findProgramAddressSync(
-      [
-        Buffer.from(METADATA_SEED),
-        mplTokenMetadata.toBuffer(),
-        mint.publicKey.toBuffer(),
-      ],
-      mplTokenMetadata
-    );
-
-    const associatedBondingCurve = await getAssociatedTokenAddress(
-      mint.publicKey,
-      this.getBondingCurvePDA(mint.publicKey),
-      true
-    );
-
-    return this.program.methods
-      .create(name, symbol, uri,creator)
-      .accounts({
-        mint: mint.publicKey,
-        associatedBondingCurve: associatedBondingCurve,
-        metadata: metadataPDA,
-        user: creator,
-      })
-      .signers([mint])
-      .transaction();
-  }
-
-  async getBuyInstructionsBySolAmount(
-    buyer: PublicKey,
-    mint: PublicKey,
-    buyAmountSol: bigint,
-    slippageBasisPoints: bigint = 500n,
-    commitment: Commitment = DEFAULT_COMMITMENT
-  ) {
-    let bondingCurveAccount = await this.getBondingCurveAccount(
-      mint,
-      commitment
-    );
-    if (!bondingCurveAccount) {
-      throw new Error(`Bonding curve account not found: ${mint.toBase58()}`);
-    }
-
-    let buyAmount = bondingCurveAccount.getBuyPrice(buyAmountSol);
-    let buyAmountWithSlippage = calculateWithSlippageBuy(
-      buyAmountSol,
-      slippageBasisPoints
-    );
-
-    let globalAccount = await this.getGlobalAccount(commitment);
-
-    return await this.getBuyInstructions(
-      buyer,
-      mint,
-      globalAccount.feeRecipient,
-      buyAmount,
-      buyAmountWithSlippage
-    );
-  }
-
-  //buy
-  async getBuyInstructions(
-    buyer: PublicKey,
-    mint: PublicKey,
-    feeRecipient: PublicKey,
-    amount: bigint,
-    solAmount: bigint,
-    commitment: Commitment = DEFAULT_COMMITMENT
-  ) {
-    const associatedBondingCurve = await getAssociatedTokenAddress(
-      mint,
-      this.getBondingCurvePDA(mint),
-      true
-    );
-
-    const associatedUser = await getAssociatedTokenAddress(mint, buyer, false);
-
-    let transaction = new Transaction();
-
-    try {
-      await getAccount(this.connection, associatedUser, commitment);
-    } catch (e) {
-      transaction.add(
-        createAssociatedTokenAccountInstruction(
-          buyer,
-          associatedUser,
-          buyer,
-          mint
-        )
-      );
-    }
-
-    transaction.add(
-      await this.program.methods
-        .buy(new BN(amount.toString()), new BN(solAmount.toString()))
-        .accounts({
-          feeRecipient: feeRecipient,
-          mint: mint,
-          associatedBondingCurve: associatedBondingCurve,
-          associatedUser: associatedUser,
-          user: buyer,
-        })
-        .transaction()
-    );
-
-    return transaction;
-  }
-
-  //sell
-  async getSellInstructionsByTokenAmount(
-    seller: PublicKey,
-    mint: PublicKey,
-    sellTokenAmount: bigint,
-    slippageBasisPoints: bigint = 500n,
-    commitment: Commitment = DEFAULT_COMMITMENT
-  ) {
-    let bondingCurveAccount = await this.getBondingCurveAccount(
-      mint,
-      commitment
-    );
-    if (!bondingCurveAccount) {
-      throw new Error(`Bonding curve account not found: ${mint.toBase58()}`);
-    }
-
-    let globalAccount = await this.getGlobalAccount(commitment);
-
-    let minSolOutput = bondingCurveAccount.getSellPrice(
-      sellTokenAmount,
-      globalAccount.feeBasisPoints
-    );
-
-    let sellAmountWithSlippage = calculateWithSlippageSell(
-      minSolOutput,
-      slippageBasisPoints
-    );
-
-    return await this.getSellInstructions(
-      seller,
-      mint,
-      globalAccount.feeRecipient,
-      sellTokenAmount,
-      sellAmountWithSlippage
-    );
-  }
-
-  async getSellInstructions(
-    seller: PublicKey,
-    mint: PublicKey,
-    feeRecipient: PublicKey,
-    amount: bigint,
-    minSolOutput: bigint
-  ) {
-    const associatedBondingCurve = await getAssociatedTokenAddress(
-      mint,
-      this.getBondingCurvePDA(mint),
-      true
-    );
-
-    const associatedUser = await getAssociatedTokenAddress(mint, seller, false);
-
-    let transaction = new Transaction();
-
-    transaction.add(
-      await this.program.methods
-        .sell(new BN(amount.toString()), new BN(minSolOutput.toString()))
-        .accounts({
-          feeRecipient: feeRecipient,
-          mint: mint,
-          associatedBondingCurve: associatedBondingCurve,
-          associatedUser: associatedUser,
-          user: seller,
-        })
-        .transaction()
-    );
-
-    return transaction;
-  }
-
-  async getBondingCurveAccount(
-    mint: PublicKey,
-    commitment: Commitment = DEFAULT_COMMITMENT
-  ) {
-    const tokenAccount = await this.connection.getAccountInfo(
-      this.getBondingCurvePDA(mint),
-      commitment
-    );
-    if (!tokenAccount) {
-      return null;
-    }
-    return BondingCurveAccount.fromBuffer(tokenAccount!.data);
-  }
-
-  async getGlobalAccount(commitment: Commitment = DEFAULT_COMMITMENT) {
-    const [globalAccountPDA] = PublicKey.findProgramAddressSync(
-      [Buffer.from(GLOBAL_ACCOUNT_SEED)],
-      new PublicKey(PROGRAM_ID)
-    );
-
-    const tokenAccount = await this.connection.getAccountInfo(
-      globalAccountPDA,
-      commitment
-    );
-
-    return GlobalAccount.fromBuffer(tokenAccount!.data);
-  }
-
-  getBondingCurvePDA(mint: PublicKey) {
-    return PublicKey.findProgramAddressSync(
-      [Buffer.from(BONDING_CURVE_SEED), mint.toBuffer()],
-      this.program.programId
-    )[0];
-  }
-
-  async createTokenMetadata(create: CreateTokenMetadata) {
-    // Validate file
-    if (!(create.file instanceof Blob)) {
-        throw new Error('File must be a Blob or File object');
-    }
-
-    let formData = new FormData();
-    formData.append("file", create.file, 'image.png'); // Add filename
-    formData.append("name", create.name);
-    formData.append("symbol", create.symbol);
-    formData.append("description", create.description);
-    formData.append("twitter", create.twitter || "");
-    formData.append("telegram", create.telegram || "");
-    formData.append("website", create.website || "");
-    formData.append("showName", "true");
-
-    try {
-        const request = await fetch("https://pump.fun/api/ipfs", {
-            method: "POST",
-            headers: {
-                'Accept': 'application/json',
-            },
-            body: formData,
-            credentials: 'same-origin'
-        });
-
-        if (request.status === 500) {
-            // Try to get more error details
-            const errorText = await request.text();
-            throw new Error(`Server error (500): ${errorText || 'No error details available'}`);
+export type PumpFun = {
+  address: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+  metadata: {
+    name: "pump";
+    version: "0.1.0";
+    spec: "0.1.0";
+    description: "Created with Anchor"; // Added description
+  };
+  instructions: [
+    {
+      name: "initialize";
+      discriminator: [175, 175, 109, 31, 13, 152, 155, 237];
+      docs: ["Creates the global state."];
+      accounts: [
+        {
+          name: "global";
+          writable: true;
+          pda: {
+            seeds: [
+              {
+                kind: "const";
+                value: [103, 108, 111, 98, 97, 108]; // "global"
+              }
+            ];
+          };
+        },
+        {
+          name: "user";
+          writable: true;
+          signer: true;
+        },
+        {
+          name: "system_program";
+          address: "11111111111111111111111111111111";
         }
-
-        if (!request.ok) {
-            throw new Error(`HTTP error! status: ${request.status}`);
+      ];
+      args: [];
+    },
+    {
+      name: "set_params"; // Renamed from setParams
+      discriminator: [27, 234, 178, 52, 147, 2, 187, 141]; // Updated discriminator
+      docs: ["Sets the global state parameters."];
+      accounts: [
+        {
+          name: "global";
+          writable: true;
+          pda: {
+            seeds: [
+              {
+                kind: "const";
+                value: [103, 108, 111, 98, 97, 108]; // "global"
+              }
+            ];
+          };
+        },
+        {
+          name: "user";
+          writable: true;
+          signer: true;
+        },
+        {
+          name: "system_program";
+          address: "11111111111111111111111111111111";
+        },
+        {
+          name: "event_authority";
+          pda: {
+            seeds: [
+              {
+                kind: "const";
+                value: [95, 95, 101, 118, 101, 110, 116, 95, 97, 117, 116, 104, 111, 114, 105, 116, 121]; // "__event_authority"
+              }
+            ];
+          };
+        },
+        {
+          name: "program";
+          address: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
         }
-
-        const responseText = await request.text();
-        if (!responseText) {
-            throw new Error('Empty response received from server');
+      ];
+      args: [
+        {
+          name: "fee_recipient"; // snake_case
+          type: "pubkey";
+        },
+        {
+          name: "initial_virtual_token_reserves"; // snake_case
+          type: "u64";
+        },
+        {
+          name: "initial_virtual_sol_reserves"; // snake_case
+          type: "u64";
+        },
+        {
+          name: "initial_real_token_reserves"; // snake_case
+          type: "u64";
+        },
+        {
+          name: "token_total_supply"; // snake_case
+          type: "u64";
+        },
+        {
+          name: "fee_basis_points"; // snake_case
+          type: "u64";
+        },
+        {
+          name: "withdraw_authority"; // Added new argument
+          type: "pubkey";
         }
-
-        try {
-            return JSON.parse(responseText);
-        } catch (e) {
-            throw new Error(`Invalid JSON response: ${responseText}`);
+      ];
+    },
+    {
+      name: "create";
+      discriminator: [24, 30, 200, 40, 5, 28, 7, 119];
+      docs: ["Creates a new coin and bonding curve."];
+      accounts: [
+        {
+          name: "mint";
+          writable: true;
+          signer: true;
+        },
+        {
+          name: "mint_authority";
+          pda: {
+            seeds: [
+              {
+                kind: "const";
+                value: [109, 105, 110, 116, 45, 97, 117, 116, 104, 111, 114, 105, 116, 121]; // "mint-authority"
+              }
+            ];
+          };
+        },
+        {
+          name: "bonding_curve"; // snake_case
+          writable: true;
+          pda: {
+            seeds: [
+              {
+                kind: "const";
+                value: [98, 111, 110, 100, 105, 110, 103, 45, 99, 117, 114, 118, 101]; // "bonding-curve"
+              },
+              {
+                kind: "account";
+                path: "mint";
+              }
+            ];
+          };
+        },
+        {
+          name: "associated_bonding_curve"; // snake_case
+          writable: true;
+          pda: {
+            seeds: [
+              {
+                kind: "account";
+                path: "bonding_curve";
+              },
+              {
+                kind: "const";
+                value: [
+                  6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 235, 121,
+                  172, 28, 180, 133, 237, 95, 91, 55, 145, 58, 140, 245, 133, 126, 255,
+                  0, 169
+                ]; // Associated token program constant
+              },
+              {
+                kind: "account";
+                path: "mint";
+              }
+            ];
+            program: {
+              kind: "const";
+              value: [
+                140, 151, 37, 143, 78, 36, 137, 241, 187, 61, 16, 41, 20, 142, 13, 131,
+                11, 90, 19, 153, 218, 255, 16, 132, 4, 142, 123, 216, 219, 233, 248, 89
+              ]; // "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+            };
+          };
+        },
+        {
+          name: "global";
+          writable: false;
+          pda: {
+            seeds: [
+              {
+                kind: "const";
+                value: [103, 108, 111, 98, 97, 108]; // "global"
+              }
+            ];
+          };
+        },
+        {
+          name: "mpl_token_metadata"; // snake_case
+          address: "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s";
+        },
+        {
+          name: "metadata";
+          writable: true;
+          pda: {
+            seeds: [
+              {
+                kind: "const";
+                value: [109, 101, 116, 97, 100, 97, 116, 97]; // "metadata"
+              },
+              {
+                kind: "const";
+                value: [
+                  11, 112, 101, 177, 227, 209, 124, 69, 56, 157, 82, 127, 107, 4, 195,
+                  205, 88, 184, 108, 115, 26, 160, 253, 181, 73, 182, 209, 188, 3, 248,
+                  41, 70
+                ]; // "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
+              },
+              {
+                kind: "account";
+                path: "mint";
+              }
+            ];
+            program: {
+              kind: "const";
+              value: [
+                11, 112, 101, 177, 227, 209, 124, 69, 56, 157, 82, 127, 107, 4, 195,
+                205, 88, 184, 108, 115, 26, 160, 253, 181, 73, 182, 209, 188, 3, 248,
+                41, 70
+              ]; // "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
+            };
+          };
+        },
+        {
+          name: "user";
+          writable: true; // Changed from isMut to writable for consistency
+          signer: true;
+        },
+        {
+          name: "system_program";
+          address: "11111111111111111111111111111111";
+        },
+        {
+          name: "token_program"; // snake_case
+          address: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+        },
+        {
+          name: "associated_token_program"; // snake_case
+          address: "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+        },
+        {
+          name: "rent";
+          address: "SysvarRent111111111111111111111111111111111";
+        },
+        {
+          name: "event_authority";
+          pda: {
+            seeds: [
+              {
+                kind: "const";
+                value: [95, 95, 101, 118, 101, 110, 116, 95, 97, 117, 116, 104, 111, 114, 105, 116, 121]; // "__event_authority"
+              }
+            ];
+          };
+        },
+        {
+          name: "program";
+          address: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
         }
-    } catch (error) {
-        console.error('Error in createTokenMetadata:', error);
-        throw error;
+      ];
+      args: [
+        {
+          name: "name";
+          type: "string";
+        },
+        {
+          name: "symbol";
+          type: "string";
+        },
+        {
+          name: "uri";
+          type: "string";
+        },
+        {
+          name: "creator"; // Added new argument
+          type: "pubkey";
+        }
+      ];
+    },
+    {
+      name: "buy";
+      discriminator: [102, 6, 61, 18, 1, 218, 235, 234];
+      docs: ["Buys tokens from a bonding curve."];
+      accounts: [
+        {
+          name: "global";
+          pda: {
+            seeds: [
+              {
+                kind: "const";
+                value: [103, 108, 111, 98, 97, 108]; // "global"
+              }
+            ];
+          };
+        },
+        {
+          name: "fee_recipient"; // snake_case
+          writable: true;
+          signer: false;
+        },
+        {
+          name: "mint";
+          writable: false;
+          signer: false;
+        },
+        {
+          name: "bonding_curve"; // snake_case
+          writable: true;
+          pda: {
+            seeds: [
+              {
+                kind: "const";
+                value: [98, 111, 110, 100, 105, 110, 103, 45, 99, 117, 114, 118, 101]; // "bonding-curve"
+              },
+              {
+                kind: "account";
+                path: "mint";
+              }
+            ];
+          };
+        },
+        {
+          name: "associated_bonding_curve"; // snake_case
+          writable: true;
+          pda: {
+            seeds: [
+              {
+                kind: "account";
+                path: "bonding_curve";
+              },
+              {
+                kind: "const";
+                value: [
+                  6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 235, 121,
+                  172, 28, 180, 133, 237, 95, 91, 55, 145, 58, 140, 245, 133, 126, 255,
+                  0, 169
+                ]; // Associated token program constant
+              },
+              {
+                kind: "account";
+                path: "mint";
+              }
+            ];
+            program: {
+              kind: "const";
+              value: [
+                140, 151, 37, 143, 78, 36, 137, 241, 187, 61, 16, 41, 20, 142, 13, 131,
+                11, 90, 19, 153, 218, 255, 16, 132, 4, 142, 123, 216, 219, 233, 248, 89
+              ]; // "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+            };
+          };
+        },
+        {
+          name: "associated_user"; // snake_case
+          writable: true;
+          signer: false;
+        },
+        {
+          name: "user";
+          writable: true;
+          signer: true;
+        },
+        {
+          name: "system_program";
+          address: "11111111111111111111111111111111";
+        },
+        {
+          name: "token_program"; // snake_case
+          address: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+        },
+        {
+          name: "rent";
+          address: "SysvarRent111111111111111111111111111111111";
+        },
+        {
+          name: "event_authority";
+          pda: {
+            seeds: [
+              {
+                kind: "const";
+                value: [95, 95, 101, 118, 101, 110, 116, 95, 97, 117, 116, 104, 111, 114, 105, 116, 121]; // "__event_authority"
+              }
+            ];
+          };
+        },
+        {
+          name: "program";
+          address: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+        }
+      ];
+      args: [
+        {
+          name: "amount";
+          type: "u64";
+        },
+        {
+          name: "max_sol_cost"; // snake_case
+          type: "u64";
+        }
+      ];
+    },
+    {
+      name: "sell";
+      discriminator: [51, 230, 133, 164, 1, 127, 131, 173];
+      docs: ["Sells tokens into a bonding curve."];
+      accounts: [
+        {
+          name: "global";
+          writable: false;
+          pda: {
+            seeds: [
+              {
+                kind: "const";
+                value: [103, 108, 111, 98, 97, 108]; // "global"
+              }
+            ];
+          };
+        },
+        {
+          name: "fee_recipient"; // snake_case
+          writable: true;
+          signer: false;
+        },
+        {
+          name: "mint";
+          writable: false;
+          signer: false;
+        },
+        {
+          name: "bonding_curve"; // snake_case
+          writable: true;
+          pda: {
+            seeds: [
+              {
+                kind: "const";
+                value: [98, 111, 110, 100, 105, 110, 103, 45, 99, 117, 114, 118, 101]; // "bonding-curve"
+              },
+              {
+                kind: "account";
+                path: "mint";
+              }
+            ];
+          };
+        },
+        {
+          name: "associated_bonding_curve"; // snake_case
+          writable: true;
+          pda: {
+            seeds: [
+              {
+                kind: "account";
+                path: "bonding_curve";
+              },
+              {
+                kind: "const";
+                value: [
+                  6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 235, 121,
+                  172, 28, 180, 133, 237, 95, 91, 55, 145, 58, 140, 245, 133, 126, 255,
+                  0, 169
+                ]; // Associated token program constant
+              },
+              {
+                kind: "account";
+                path: "mint";
+              }
+            ];
+            program: {
+              kind: "const";
+              value: [
+                140, 151, 37, 143, 78, 36, 137, 241, 187, 61, 16, 41, 20, 142, 13, 131,
+                11, 90, 19, 153, 218, 255, 16, 132, 4, 142, 123, 216, 219, 233, 248, 89
+              ]; // "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+            };
+          };
+        },
+        {
+          name: "associated_user"; // snake_case
+          writable: true;
+          signer: false;
+        },
+        {
+          name: "user";
+          writable: true;
+          signer: true;
+        },
+        {
+          name: "system_program";
+          address: "11111111111111111111111111111111";
+        },
+        {
+          name: "associated_token_program"; // snake_case
+          address: "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+        },
+        {
+          name: "token_program"; // snake_case
+          address: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+        },
+        {
+          name: "event_authority";
+          pda: {
+            seeds: [
+              {
+                kind: "const";
+                value: [95, 95, 101, 118, 101, 110, 116, 95, 97, 117, 116, 104, 111, 114, 105, 116, 121]; // "__event_authority"
+              }
+            ];
+          };
+        },
+        {
+          name: "program";
+          address: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+        }
+      ];
+      args: [
+        {
+          name: "amount";
+          type: "u64";
+        },
+        {
+          name: "min_sol_output"; // snake_case
+          type: "u64";
+        }
+      ];
+    },
+    {
+      name: "withdraw";
+      discriminator: [183, 18, 70, 156, 148, 109, 161, 34];
+      docs: ["Allows the admin to withdraw liquidity for a migration once the bonding curve completes"];
+      accounts: [
+        {
+          name: "global";
+          writable: false;
+          pda: {
+            seeds: [
+              {
+                kind: "const";
+                value: [103, 108, 111, 98, 97, 108]; // "global"
+              }
+            ];
+          };
+        },
+        {
+          name: "last_withdraw"; // Renamed to snake_case
+          writable: true;
+          pda: {
+            seeds: [
+              {
+                kind: "const";
+                value: [108, 97, 115, 116, 45, 119, 105, 116, 104, 100, 114, 97, 119]; // "last-withdraw"
+              }
+            ];
+          };
+        },
+        {
+          name: "mint";
+          writable: false;
+          signer: false;
+        },
+        {
+          name: "bonding_curve"; // snake_case
+          writable: true;
+          pda: {
+            seeds: [
+              {
+                kind: "const";
+                value: [98, 111, 110, 100, 105, 110, 103, 45, 99, 117, 114, 118, 101]; // "bonding-curve"
+              },
+              {
+                kind: "account";
+                path: "mint";
+              }
+            ];
+          };
+        },
+        {
+          name: "associated_bonding_curve"; // snake_case
+          writable: true;
+          pda: {
+            seeds: [
+              {
+                kind: "account";
+                path: "bonding_curve";
+              },
+              {
+                kind: "const";
+                value: [
+                  6, 221, 246, 225, 215, 101, 161, 147, 217, 203, 225, 70, 206, 235, 121,
+                  172, 28, 180, 133, 237, 95, 91, 55, 145, 58, 140, 245, 133, 126, 255,
+                  0, 169
+                ]; // Associated token program constant
+              },
+              {
+                kind: "account";
+                path: "mint";
+              }
+            ];
+            program: {
+              kind: "const";
+              value: [
+                140, 151, 37, 143, 78, 36, 137, 241, 187, 61, 16, 41, 20, 142, 13, 131,
+                11, 90, 19, 153, 218, 255, 16, 132, 4, 142, 123, 216, 219, 233, 248, 89
+              ]; // "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+            };
+          };
+        },
+        {
+          name: "associated_user"; // snake_case
+          writable: true;
+          signer: false;
+        },
+        {
+          name: "user";
+          writable: true;
+          signer: true;
+        },
+        {
+          name: "system_program";
+          address: "11111111111111111111111111111111";
+        },
+        {
+          name: "token_program"; // snake_case
+          address: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+        },
+        {
+          name: "rent";
+          address: "SysvarRent111111111111111111111111111111111";
+        },
+        {
+          name: "event_authority";
+          pda: {
+            seeds: [
+              {
+                kind: "const";
+                value: [95, 95, 101, 118, 101, 110, 116, 95, 97, 117, 116, 104, 111, 114, 105, 116, 121]; // "__event_authority"
+              }
+            ];
+          };
+        },
+        {
+          name: "program";
+          address: "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
+        }
+      ];
+      args: [];
     }
-}
-  //EVENTS
-  addEventListener<T extends PumpFunEventType>(
-    eventType: T,
-    callback: (
-      event: PumpFunEventHandlers[T],
-      slot: number,
-      signature: string
-    ) => void
-  ) {
-    return this.program.addEventListener(
-      eventType,
-      (event: any, slot: number, signature: string) => {
-        let processedEvent;
-        switch (eventType) {
-          case "createEvent":
-            processedEvent = toCreateEvent(event as CreateEvent);
-            callback(
-              processedEvent as PumpFunEventHandlers[T],
-              slot,
-              signature
-            );
-            break;
-          case "tradeEvent":
-            processedEvent = toTradeEvent(event as TradeEvent);
-            callback(
-              processedEvent as PumpFunEventHandlers[T],
-              slot,
-              signature
-            );
-            break;
-          case "completeEvent":
-            processedEvent = toCompleteEvent(event as CompleteEvent);
-            callback(
-              processedEvent as PumpFunEventHandlers[T],
-              slot,
-              signature
-            );
-            console.log("completeEvent", event, slot, signature);
-            break;
-          case "setParamsEvent":
-            processedEvent = toSetParamsEvent(event as SetParamsEvent);
-            callback(
-              processedEvent as PumpFunEventHandlers[T],
-              slot,
-              signature
-            );
-            break;
-          default:
-            console.error("Unhandled event type:", eventType);
-        }
-      }
-    );
-  }
-
-  removeEventListener(eventId: number) {
-    this.program.removeEventListener(eventId);
-  }
-}
+  ];
+  accounts: [
+    {
+      name: "BondingCurve"; // PascalCase for consistency
+      discriminator: [23, 183, 248, 55, 96, 216, 172, 96];
+    },
+    {
+      name: "Global"; // PascalCase for consistency
+      discriminator: [167, 232, 232, 177, 200, 108, 114, 127];
+    },
+    {
+      name: "LastWithdraw"; // Added, PascalCase for consistency
+      discriminator: [203, 18, 220, 103, 120, 145, 187, 2];
+    }
+  ];
+  events: [
+    {
+      name: "CreateEvent"; // PascalCase for consistency
+      discriminator: [27, 114, 169, 77, 222, 235, 99, 118];
+    },
+    {
+      name: "TradeEvent"; // PascalCase for consistency
+      discriminator: [189, 219, 127, 211, 78, 230, 97, 238];
+    },
+    {
+      name: "CompleteEvent"; // PascalCase for consistency
+      discriminator: [95, 114, 97, 156, 212, 46, 152, 8];
+    },
+    {
+      name: "SetParamsEvent"; // PascalCase for consistency
+      discriminator: [223, 195, 159, 246, 62, 48, 143, 131];
+    }
+  ];
+  types: [
+    {
+      name: "Global"; // PascalCase for consistency
+      type: {
+        kind: "struct";
+        fields: [
+          {
+            name: "initialized";
+            type: "bool";
+          },
+          {
+            name: "authority";
+            type: "pubkey";
+          },
+          {
+            name: "fee_recipient"; // snake_case
+            type: "pubkey";
+          },
+          {
+            name: "initial_virtual_token_reserves"; // snake_case
+            type: "u64";
+          },
+          {
+            name: "initial_virtual_sol_reserves"; // snake_case
+            type: "u64";
+          },
+          {
+            name: "initial_real_token_reserves"; // snake_case
+            type: "u64";
+          },
+          {
+            name: "token_total_supply"; // snake_case
+            type: "u64";
+          },
+          {
+            name: "fee_basis_points"; // snake_case
+            type: "u64";
+          }
+        ];
+      };
+    },
+    {
+      name: "LastWithdraw"; // PascalCase for consistency
+      type: {
+        kind: "struct";
+        fields: [
+          {
+            name: "last_withdraw_timestamp"; // snake_case
+            type: "i64";
+          }
+        ];
+      };
+    },
+    {
+      name: "BondingCurve"; // PascalCase for consistency
+      type: {
+        kind: "struct";
+        fields: [
+          {
+            name: "virtual_token_reserves"; // snake_case
+            type: "u64";
+          },
+          {
+            name: "virtual_sol_reserves"; // snake_case
+            type: "u64";
+          },
+          {
+            name: "real_token_reserves"; // snake_case
+            type: "u64";
+          },
+          {
+            name: "real_sol_reserves"; // snake_case
+            type: "u64";
+          },
+          {
+            name: "token_total_supply"; // snake_case
+            type: "u64";
+          },
+          {
+            name: "complete";
+            type: "bool";
+          }
+        ];
+      };
+    },
+    {
+      name: "CreateEvent"; // PascalCase for consistency
+      type: {
+        kind: "struct";
+        fields: [
+          {
+            name: "name";
+            type: "string";
+            index: false;
+          },
+          {
+            name: "symbol";
+            type: "string";
+            index: false;
+          },
+          {
+            name: "uri";
+            type: "string";
+            index: false;
+          },
+          {
+            name: "mint";
+            type: "pubkey";
+            index: false;
+          },
+          {
+            name: "bonding_curve"; // snake_case
+            type: "pubkey";
+            index: false;
+          },
+          {
+            name: "user";
+            type: "pubkey";
+            index: false;
+          }
+        ];
+      };
+    },
+    {
+      name: "TradeEvent"; // PascalCase for consistency
+      type: {
+        kind: "struct";
+        fields: [
+          {
+            name: "mint";
+            type: "pubkey";
+            index: false;
+          },
+          {
+            name: "sol_amount"; // snake_case
+            type: "u64";
+            index: false;
+          },
+          {
+            name: "token_amount"; // snake_case
+            type: "u64";
+            index: false;
+          },
+          {
+            name: "is_buy"; // snake_case
+            type: "bool";
+            index: false;
+          },
+          {
+            name: "user";
+            type: "pubkey";
+            index: false;
+          },
+          {
+            name: "timestamp";
+            type: "i64";
+            index: false;
+          },
+          {
+            name: "virtual_sol_reserves"; // snake_case
+            type: "u64";
+            index: false;
+          },
+          {
+            name: "virtual_token_reserves"; // snake_case
+            type: "u64";
+            index: false;
+          },
+          {
+            name: "real_sol_reserves"; // snake_case
+            type: "u64";
+            index: false;
+          },
+          {
+            name: "real_token_reserves"; // snake_case
+            type: "u64";
+            index: false;
+          }
+        ];
+      };
+    },
+    {
+      name: "CompleteEvent"; // PascalCase for consistency
+      type: {
+        kind: "struct";
+        fields: [
+          {
+            name: "user";
+            type: "pubkey";
+            index: false;
+          },
+          {
+            name: "mint";
+            type: "pubkey";
+            index: false;
+          },
+          {
+            name: "bonding_curve"; // snake_case
+            type: "pubkey";
+            index: false;
+          },
+          {
+            name: "timestamp";
+            type: "i64";
+            index: false;
+          }
+        ];
+      };
+    },
+    {
+      name: "SetParamsEvent"; // PascalCase for consistency
+      type: {
+        kind: "struct";
+        fields: [
+          {
+            name: "fee_recipient"; // snake_case
+            type: "pubkey";
+            index: false;
+          },
+          {
+            name: "initial_virtual_token_reserves"; // snake_case
+            type: "u64";
+            index: false;
+          },
+          {
+            name: "initial_virtual_sol_reserves"; // snake_case
+            type: "u64";
+            index: false;
+          },
+          {
+            name: "initial_real_token_reserves"; // snake_case
+            type: "u64";
+            index: false;
+          },
+          {
+            name: "token_total_supply"; // snake_case
+            type: "u64";
+            index: false;
+          },
+          {
+            name: "fee_basis_points"; // snake_case
+            type: "u64";
+            index: false;
+          }
+        ];
+      };
+    }
+  ];
+  errors: [
+    {
+      code: 6000;
+      name: "NotAuthorized";
+      msg: "The given account is not authorized to execute this instruction.";
+    },
+    {
+      code: 6001;
+      name: "AlreadyInitialized";
+      msg: "The program is already initialized.";
+    },
+    {
+      code: 6002;
+      name: "TooMuchSolRequired";
+      msg: "slippage: Too much SOL required to buy the given amount of tokens.";
+    },
+    {
+      code: 6003;
+      name: "TooLittleSolReceived";
+      msg: "slippage: Too little SOL received to sell the given amount of tokens.";
+    },
+    {
+      code: 6004;
+      name: "MintDoesNotMatchBondingCurve";
+      msg: "The mint does not match the bonding curve.";
+    },
+    {
+      code: 6005;
+      name: "BondingCurveComplete";
+      msg: "The bonding curve has completed and liquidity migrated to raydium.";
+    },
+    {
+      code: 6006;
+      name: "BondingCurveNotComplete";
+      msg: "The bonding curve has not completed.";
+    },
+    {
+      code: 6007;
+      name: "NotInitialized";
+      msg: "The program is not initialized.";
+    },
+    {
+      code: 6008;
+      name: "WithdrawTooFrequent";
+      msg: "Withdraw too frequent";
+    }
+  ];
+};
